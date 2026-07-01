@@ -1,0 +1,8 @@
+{
+  "name": "agentos-rh",
+  "version": "1.0.0",
+  "main": "Bot.js",
+  "scripts": {
+    "start": "node Bot.js"
+  }
+}
