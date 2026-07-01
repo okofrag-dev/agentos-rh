@@ -1,0 +1,195 @@
+const https = require("https");
+const crypto = require("crypto");
+
+const TOKEN = process.env.TELEGRAM_TOKEN;
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+const SHEET_ID = process.env.SHEET_ID;
+const GOOGLE_SERVICE_EMAIL = process.env.GOOGLE_SERVICE_EMAIL;
+const GOOGLE_PRIVATE_KEY = (process.env.GOOGLE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
+
+console.log("Bot RH démarré, token:", TOKEN ? TOKEN.substring(0, 15) + "..." : "MANQUANT");
+console.log("Sheets service:", GOOGLE_SERVICE_EMAIL ? "OK" : "MANQUANT");
+
+// ─── TELEGRAM ────────────────────────────────────────────────────────────────
+function telegramRequest(method, body) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify(body);
+    const req = https.request(
+      { hostname: "api.telegram.org", path: `/bot${TOKEN}/${method}`, method: "POST",
+        headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) } },
+      (res) => { let d = ""; res.on("data", c => d += c); res.on("end", () => resolve(JSON.parse(d))); }
+    );
+    req.on("error", reject);
+    req.write(data);
+    req.end();
+  });
+}
+
+function sendMessage(chatId, text) {
+  return telegramRequest("sendMessage", { chat_id: chatId, text, parse_mode: "Markdown" });
+}
+
+// ─── SHEETS (compte de service JWT) ───────────────────────────────────────────
+async function getSheetsAccessToken() {
+  const now = Math.floor(Date.now() / 1000);
+  const claim = {
+    iss: GOOGLE_SERVICE_EMAIL,
+    scope: "https://www.googleapis.com/auth/spreadsheets",
+    aud: "https://oauth2.googleapis.com/token",
+    exp: now + 3600, iat: now
+  };
+  const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url");
+  const payload = Buffer.from(JSON.stringify(claim)).toString("base64url");
+  const signingInput = `${header}.${payload}`;
+  const sign = crypto.createSign("RSA-SHA256");
+  sign.update(signingInput);
+  const signature = sign.sign(GOOGLE_PRIVATE_KEY, "base64url");
+  const jwt = `${signingInput}.${signature}`;
+
+  return new Promise((resolve, reject) => {
+    const body = new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion: jwt
+    }).toString();
+    const req = https.request(
+      { hostname: "oauth2.googleapis.com", path: "/token", method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded", "Content-Length": Buffer.byteLength(body) } },
+      (res) => { let d = ""; res.on("data", c => d += c); res.on("end", () => { try { resolve(JSON.parse(d).access_token || null); } catch(e) { resolve(null); } }); }
+    );
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+function sheetsRequest(path, accessToken, method = "GET", body = null) {
+  return new Promise((resolve, reject) => {
+    const data = body ? JSON.stringify(body) : null;
+    const headers = { "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" };
+    if (data) headers["Content-Length"] = Buffer.byteLength(data);
+    const req = https.request(
+      { hostname: "sheets.googleapis.com", path, method, headers },
+      (res) => { let d = ""; res.on("data", c => d += c); res.on("end", () => { try { resolve(JSON.parse(d)); } catch(e) { resolve(d); } }); }
+    );
+    req.on("error", reject);
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+async function addHoursToSheet(date, employee, hours, comment) {
+  const token = await getSheetsAccessToken();
+  if (!token) return "⚠️ Erreur de connexion. Préviens ton responsable.";
+  const body = { values: [[date, employee, hours, comment || ""]] };
+  const result = await sheetsRequest(
+    `/v4/spreadsheets/${SHEET_ID}/values/A:D:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
+    token, "POST", body
+  );
+  return result.updates ? `✅ Merci ! J'ai bien enregistré *${hours}h* pour *${employee}* le ${date}.` : "⚠️ Erreur d'enregistrement. Réessaie.";
+}
+
+// ─── CLAUDE ──────────────────────────────────────────────────────────────────
+const SYSTEM_PROMPT = `Tu es l'assistant RH d'un restaurant. Ton unique rôle est d'enregistrer les heures de travail des employés qui t'écrivent.
+
+Les employés t'envoient leurs heures en langage naturel (ex: "j'ai fait 8h aujourd'hui", "hier de 9h à 17h", "lundi 6h").
+
+RÈGLE ABSOLUE : dès que tu as le PRÉNOM de l'employé + une date + un nombre d'heures, réponds UNIQUEMENT avec ce JSON, sans aucune explication :
+{"action":"log_hours","date":"JJ/MM/AAAA","employee":"prénom","hours":"X","comment":""}
+
+- Si tu ne connais pas encore le prénom de l'employé, demande-lui gentiment son prénom d'abord.
+- Une fois le prénom connu, mémorise-le pour cette conversation.
+- Si "aujourd'hui"/"hier"/un jour de la semaine est mentionné, calcule la date à partir de la date du jour.
+- Si l'employé calcule des heures à partir d'un créneau (ex: 9h à 17h = 8h), fais le calcul toi-même.
+
+Sois chaleureux, simple et bref. Réponds toujours en français.
+NE JAMAIS expliquer le fonctionnement technique.`;
+
+async function askClaude(history, message) {
+  const today = new Date().toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "numeric", year: "numeric" });
+  const messages = [...history, { role: "user", content: message }];
+  const body = JSON.stringify({
+    model: "claude-sonnet-4-6", max_tokens: 400,
+    system: SYSTEM_PROMPT + `\n\nDate du jour : ${today}`, messages
+  });
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      { hostname: "api.anthropic.com", path: "/v1/messages", method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY,
+                   "anthropic-version": "2023-06-01", "Content-Length": Buffer.byteLength(body) } },
+      (res) => {
+        let d = "";
+        res.on("data", c => d += c);
+        res.on("end", () => { try { resolve(JSON.parse(d).content?.[0]?.text || "Désolé, réessaie."); } catch(e) { reject(e); } });
+      }
+    );
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// ─── HANDLER ─────────────────────────────────────────────────────────────────
+const userState = {};
+
+async function handleUpdate(update) {
+  if (!update.message?.text) return;
+  const chatId = update.message.chat.id;
+  const text = update.message.text;
+
+  if (!userState[chatId]) userState[chatId] = { history: [] };
+  const state = userState[chatId];
+
+  if (text === "/start") {
+    await sendMessage(chatId, "👋 *Bonjour !*\n\nJe suis l'assistant qui enregistre tes heures de travail.\n\nDis-moi simplement ton prénom et tes heures, par exemple :\n_\"Je suis Julie, j'ai fait 8h aujourd'hui\"_");
+    return;
+  }
+  if (text === "/reset") {
+    state.history = [];
+    await sendMessage(chatId, "🔄 On recommence à zéro. Quel est ton prénom ?");
+    return;
+  }
+
+  await telegramRequest("sendChatAction", { chat_id: chatId, action: "typing" });
+
+  try {
+    const reply = await askClaude(state.history, text);
+
+    try {
+      const parsed = JSON.parse(reply);
+      if (parsed.action === "log_hours") {
+        const result = await addHoursToSheet(parsed.date, parsed.employee, parsed.hours, parsed.comment);
+        // On garde le prénom en mémoire
+        state.history.push({ role: "user", content: text });
+        state.history.push({ role: "assistant", content: `Heures enregistrées pour ${parsed.employee}.` });
+        await sendMessage(chatId, result);
+        return;
+      }
+    } catch(e) { /* Pas un JSON */ }
+
+    state.history.push({ role: "user", content: text });
+    state.history.push({ role: "assistant", content: reply });
+    if (state.history.length > 20) state.history = state.history.slice(-20);
+    await sendMessage(chatId, reply);
+
+  } catch(err) {
+    console.error("Erreur:", err);
+    await sendMessage(chatId, "⚠️ Petit souci technique, réessaie dans un instant.");
+  }
+}
+
+// ─── POLLING ─────────────────────────────────────────────────────────────────
+let offset = 0;
+async function poll() {
+  try {
+    const result = await telegramRequest("getUpdates", { offset, timeout: 25, allowed_updates: ["message"] });
+    if (result.ok && result.result.length > 0) {
+      for (const update of result.result) {
+        offset = update.update_id + 1;
+        await handleUpdate(update);
+      }
+    }
+  } catch(err) { console.error("Erreur polling:", err.message); }
+  setTimeout(poll, 500);
+}
+
+poll();
