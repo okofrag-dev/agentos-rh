@@ -6,6 +6,7 @@ const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 const SHEET_ID = process.env.SHEET_ID;
 const GOOGLE_SERVICE_EMAIL = process.env.GOOGLE_SERVICE_EMAIL;
 const GOOGLE_PRIVATE_KEY = (process.env.GOOGLE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
+const BOSS_CHAT_ID = "8291918824";
 
 console.log("Bot RH démarré, token:", TOKEN ? TOKEN.substring(0, 15) + "..." : "MANQUANT");
 console.log("Sheets service:", GOOGLE_SERVICE_EMAIL ? "OK" : "MANQUANT");
@@ -217,5 +218,53 @@ async function poll() {
   } catch(err) { console.error("Erreur polling:", err.message); }
   setTimeout(poll, 500);
 }
+// ─── RÉCAP QUOTIDIEN À 3H00 (heure de Paris) ──────────────────────────────────
+async function getDailyReport(dateStr) {
+  const token = await getSheetsAccessToken();
+  if (!token) return null;
+  const result = await sheetsRequest(`/v4/spreadsheets/${SHEET_ID}/values/A:D`, token);
+  if (!result.values || result.values.length <= 1) return null;
 
+  const totals = {};
+  for (const row of result.values) {
+    if (row[0] === "Date" || !row[0] || !row[1] || !row[2]) continue;
+    if (row[0].trim() === dateStr) {
+      const employee = row[1].trim();
+      totals[employee] = (totals[employee] || 0) + (parseFloat(row[2]) || 0);
+    }
+  }
+  if (Object.keys(totals).length === 0) return `🌙 *Récap du ${dateStr}*\n\nAucune heure enregistrée aujourd'hui.`;
+
+  let out = `🌙 *Récap du ${dateStr}*\n\n`;
+  let total = 0;
+  for (const [employee, hours] of Object.entries(totals).sort()) {
+    out += `👤 ${employee} — *${hours}h*\n`;
+    total += hours;
+  }
+  out += `\n⏱️ *Total équipe : ${total}h*`;
+  return out;
+}
+
+let lastReportDate = null;
+async function checkDailyReport() {
+  const parisNow = new Date(new Date().toLocaleString("en-US", { timeZone: "Europe/Paris" }));
+  const h = parisNow.getHours();
+  const m = parisNow.getMinutes();
+
+  // La journée qui vient de se terminer = la veille de "maintenant" à 3h
+  const businessDay = new Date(parisNow);
+  businessDay.setDate(businessDay.getDate() - 1);
+  const jj = String(businessDay.getDate()).padStart(2, "0");
+  const mm = String(businessDay.getMonth() + 1).padStart(2, "0");
+  const dateStr = `${jj}/${mm}/${businessDay.getFullYear()}`;
+
+  // Déclenche une seule fois entre 3h00 et 3h04
+  if (h === 3 && m < 5 && lastReportDate !== dateStr) {
+    lastReportDate = dateStr;
+    const report = await getDailyReport(dateStr);
+    if (report) await sendMessage(BOSS_CHAT_ID, report);
+    console.log("Récap quotidien envoyé pour", dateStr);
+  }
+}
+setInterval(checkDailyReport, 60 * 1000); // vérifie chaque minute
 poll();
