@@ -104,12 +104,25 @@ RÈGLE ABSOLUE : dès que tu as le PRÉNOM de l'employé + une date + un nombre 
 Sois chaleureux, simple et bref. Réponds toujours en français.
 NE JAMAIS expliquer le fonctionnement technique.`;
 
+function getBusinessDate() {
+  // Heure actuelle en fuseau de Paris
+  const parisNow = new Date(new Date().toLocaleString("en-US", { timeZone: "Europe/Paris" }));
+  // Si avant 3h du matin, on rattache à la veille
+  if (parisNow.getHours() < 3) {
+    parisNow.setDate(parisNow.getDate() - 1);
+  }
+  const jj = String(parisNow.getDate()).padStart(2, "0");
+  const mm = String(parisNow.getMonth() + 1).padStart(2, "0");
+  const aaaa = parisNow.getFullYear();
+  return `${jj}/${mm}/${aaaa}`;
+}
+
 async function askClaude(history, message) {
-  const today = new Date().toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "numeric", year: "numeric" });
+  const businessDate = getBusinessDate();
   const messages = [...history, { role: "user", content: message }];
   const body = JSON.stringify({
     model: "claude-sonnet-4-6", max_tokens: 400,
-    system: SYSTEM_PROMPT + `\n\nDate du jour : ${today}`, messages
+    system: SYSTEM_PROMPT + `\n\nDate de travail à utiliser pour l'enregistrement : ${businessDate}`, messages
   });
   return new Promise((resolve, reject) => {
     const req = https.request(
